@@ -27,31 +27,33 @@ def _collection_name(user_id: str) -> str:
     return f"u_{safe}"[:63]
 
 
-def upsert_transactions(
+def compute_embeddings(texts: list[str]) -> list[list[float]]:
+    """Encode texts into embedding vectors. Can run in parallel with categorization."""
+    return _get_model().encode(texts, show_progress_bar=False).tolist()
+
+
+def store_to_chromadb(
     user_id: str,
     tx_ids: list[str],
     dates: list[date],
     descriptions: list[str],
     amounts: list[Decimal],
     categories: list[str],
+    embeddings: list[list[float]],
 ) -> None:
+    """Store pre-computed embeddings into ChromaDB. Can run in parallel with Postgres save."""
     if not tx_ids:
         return
 
-    model = _get_model()
-    client = _get_chroma()
-    collection = client.get_or_create_collection(name=_collection_name(user_id))
-
+    collection = _get_chroma().get_or_create_collection(name=_collection_name(user_id))
     texts = [
         f"Date: {d} | Description: {desc} | Amount: {float(amt):.2f} | Category: {cat}"
         for d, desc, amt, cat in zip(dates, descriptions, amounts, categories)
     ]
-    embeddings = model.encode(texts, show_progress_bar=False).tolist()
     metadatas = [
         {"date": str(d), "description": desc, "amount": float(amt), "category": cat}
         for d, desc, amt, cat in zip(dates, descriptions, amounts, categories)
     ]
-
     collection.upsert(ids=tx_ids, embeddings=embeddings, documents=texts, metadatas=metadatas)
 
 

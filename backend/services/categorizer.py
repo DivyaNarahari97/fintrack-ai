@@ -1,4 +1,5 @@
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import anthropic
 from .parser import RawTransaction
 
@@ -20,11 +21,16 @@ def _get_client() -> anthropic.Anthropic:
 
 
 def categorize_transactions(transactions: list[RawTransaction]) -> list[str]:
-    result: list[str] = []
-    for i in range(0, len(transactions), BATCH_SIZE):
-        batch = transactions[i : i + BATCH_SIZE]
-        result.extend(_categorize_batch(batch))
-    return result
+    batches = [
+        (i, transactions[i : i + BATCH_SIZE])
+        for i in range(0, len(transactions), BATCH_SIZE)
+    ]
+    results: dict[int, list[str]] = {}
+    with ThreadPoolExecutor(max_workers=min(len(batches), 5)) as pool:
+        futures = {pool.submit(_categorize_batch, batch): idx for idx, batch in batches}
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+    return [cat for idx in sorted(results) for cat in results[idx]]
 
 
 def _categorize_batch(batch: list[RawTransaction]) -> list[str]:

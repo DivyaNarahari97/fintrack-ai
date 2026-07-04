@@ -10,7 +10,7 @@ from database import AsyncSessionLocal, get_db
 from models import Statement, Transaction, User
 from schemas import StatementOut, UploadResponse
 from services.categorizer import categorize_transactions
-from services.embedder import upsert_transactions
+from services.embedder import compute_embeddings, store_to_chromadb
 from services.parser import parse_file
 
 router = APIRouter()
@@ -27,12 +27,23 @@ async def _process_statement(
         if stmt is None:
             return
         try:
+            # Step 1: parse (everything depends on this)
             raw_txs = await asyncio.to_thread(parse_file, file_bytes, filename)
-            categories = await asyncio.to_thread(categorize_transactions, raw_txs)
 
-            tx_rows: list[Transaction] = []
-            for raw, category in zip(raw_txs, categories):
-                tx = Transaction(
+            embed_texts = [
+                f"Date: {r.date} | Description: {r.description} | Amount: {float(r.amount):.2f}"
+                for r in raw_txs
+            ]
+
+            # Step 2: categorize + embed in parallel (both only need raw_txs)
+            categories, embeddings = await asyncio.gather(
+                asyncio.to_thread(categorize_transactions, raw_txs),
+                asyncio.to_thread(compute_embeddings, embed_texts),
+            )
+
+            # Step 3: build Transaction rows (IDs generated here, not by DB)
+            tx_rows: list[Transaction] = [
+                Transaction(
                     id=uuid.uuid4(),
                     statement_id=statement_id,
                     user_id=user_id,
@@ -43,20 +54,27 @@ async def _process_statement(
                     category=category,
                     raw_text=raw.raw_text,
                 )
-                tx_rows.append(tx)
+                for raw, category in zip(raw_txs, categories)
+            ]
+            for tx in tx_rows:
                 db.add(tx)
 
-            await db.flush()
-            await db.commit()
+            # Step 4: flush to Postgres + store to ChromaDB in parallel
+            async def _pg_flush() -> None:
+                await db.flush()
 
-            await asyncio.to_thread(
-                upsert_transactions,
-                user_id,
-                [str(tx.id) for tx in tx_rows],
-                [tx.date for tx in tx_rows],
-                [tx.description for tx in tx_rows],
-                [tx.amount for tx in tx_rows],
-                [tx.category or "Other" for tx in tx_rows],
+            await asyncio.gather(
+                _pg_flush(),
+                asyncio.to_thread(
+                    store_to_chromadb,
+                    user_id,
+                    [str(tx.id) for tx in tx_rows],
+                    [tx.date for tx in tx_rows],
+                    [tx.description for tx in tx_rows],
+                    [tx.amount for tx in tx_rows],
+                    [tx.category or "Other" for tx in tx_rows],
+                    embeddings,
+                ),
             )
 
             stmt.status = "done"
